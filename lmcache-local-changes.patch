@@ -1,0 +1,879 @@
+diff --git a/benchmarks/rag/README.md b/benchmarks/rag/README.md
+index f7515a5..98ed98b 100644
+--- a/benchmarks/rag/README.md
++++ b/benchmarks/rag/README.md
+@@ -1,7 +1,7 @@
+ # Benchmarking LLM Performance: RAG Use Case
+ ## Overview
+ 
+-This repository contains benchmarking tools for evaluating the performance of language models in various scenarios. The initial focus of this benchmark is on the RAG (Retrieval-augmented generation) use case. The script `rag.py` simulates RAG workloads, allowing you to analyze the serving engine's throughput and latency.  
++This directory contains benchmarking tools for evaluating RAG-style workloads with LMCache and vLLM. The main evaluator is `rag.py`, which measures request-level latency and quality over JSON datasets stored in `benchmarks/rag/inputs/`.
+ 
+ ### Current Workloads
+ 
+@@ -9,45 +9,58 @@ This repository contains benchmarking tools for evaluating the performance of la
+ 
+ ## Setup
+ 
+-1. Install the required dependencies:
++1. Install the required dependencies in the environment that will run the benchmark client:
+    ```bash
+    pip install -r requirements.txt
+    ```
+ ## Running the RAG Benchmark
+-To run the RAG benchmark, use launch_lmcache.sh and launch_vllm.sh.  
++To run the RAG benchmark, use `launch_lmcache.sh` and `launch_vllm.sh`.
+ 
+-How to launch:  
+-After starting the serving engine, run ./launch_lmcache.sh or ./launch_vllm.sh to benchmark LMcache or vllm.  
++After starting the serving engine, run `./launch_lmcache.sh` or `./launch_vllm.sh` from this directory.
+ 
+-For launch_lmcache.sh:  
+-Remember to match KV_STORAGE_SIZE with max_local_cache_size in lmcache config yaml.  
+-Remember to match KV_CHUNK_SIZE with chunk_size in lmcache config yaml.  
+-
+-For launch_vllm.sh:  
+-Remember to change END_INDEX in launch_vllm.sh to the end_index printed by precompute.py in launch_lmcache.sh.  
+-It should be 150 in the following line(the second number).  
+-```
+-"Precompute from 0 to 150 for model mistralai/Mistral-7B-Instruct-v0.2"
++Useful environment overrides:
++```bash
++MODEL_NAME=Qwen/Qwen2.5-0.5B-Instruct
++DATASET_PATH=benchmarks/rag/inputs/musique_s.json
++QPS=1.0
++END_INDEX=16
++MAX_TOKENS=16
++BASE_URL=http://localhost:8000/v1
++API_KEY=EMPTY
+ ```
+ 
+-Use ctrl-C to terminate the benchmark at any time, and the the script will write each request's detailed stats to the output file.  
++`launch_lmcache.sh`:
++- precomputes document KV by sending lightweight requests to the running LMCache endpoint
++- then runs `rag.py` with the real benchmark prompts
++- if `END_INDEX` is unset, it uses `precompute.py` to determine how many requests fit in `KV_STORAGE_SIZE`
++- if `END_INDEX` is set, it precomputes exactly that range
+ 
++`launch_vllm.sh`:
++- runs the same workload against a plain vLLM endpoint
++- if `END_INDEX` is unset, it uses the full dataset length
++- for apples-to-apples comparison with LMCache, reuse the `END_INDEX` printed by `launch_lmcache.sh`
+ 
+-*Note:* the above command requires there is a serving engine with the `mistralai/Mistral-7B-Instruct-v0.2` model served locally at `http://localhost:8000/v1`. Here's an example command to launch the serving engine:
++Use `Ctrl-C` to terminate the benchmark at any time; `rag.py` will still write the results collected so far to the output CSV.
++
++Example baseline server:
+ 
+ ```bash
+-vllm serve mistralai/Mistral-7B-Instruct-v0.2 --disable-log-requests
++vllm serve mistralai/Mistral-7B-Instruct-v0.2 --port 8000 --disable-log-requests
+ ```
+ 
+-Here's an example command to launch the serving engine with LMCache+CacheBlend:  
++Example LMCache + CacheBlend server:
+ 
+ ```bash
+-LMCACHE_CONFIG_FILE=example_blending.yaml python3 -m lmcache_vllm.vllm.entrypoints.openai.api_server --model mistralai/Mistral-7B-Instruct-v0.2 --gpu-memory-utilization 0.7 --port 8000
++LMCACHE_CONFIG_FILE=benchmarks/rag/lmcache_blend.yaml \
++vllm serve mistralai/Mistral-7B-Instruct-v0.2 \
++  --port 8000 \
++  --disable-log-requests \
++  --no-enable-prefix-caching \
++  --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}'
+ ```
+ 
+ ### What does precompute.py do
+-If no --end-index provided, it will check kv-storage-size and try to precompute the documents that can be held in this size.  
+-Used for precomputing some KV cache into storage.  
++`precompute.py` sends one lightweight completion request per document to the running LMCache endpoint so the document KV can be reused later during the benchmark. If `--kv-storage-size` is provided, it estimates how many requests fit within that cache budget and stops there. If `--end-index` is provided, it precomputes that fixed range.
+ ### Arguments
+ #### Configure the workload
+ - `--dataset <str>` The path to the dataset. The format is described in `Dataset format` section.  
+@@ -77,6 +90,11 @@ To benchmark CacheBlend, we need to precompute the KV cache of documents.
+ - `--output <str>` The csv file to dump the detailed stats for each query (default = summary.csv)
+ - `--verbose` Enable verbose logging.
+ 
++### Dataset notes
++- QA datasets such as `musique_s.json` and `wikimqa_s.json` should use `PROMPT_BUILD_METHOD=QA`
++- summarization datasets such as `samsum.json` and `multinews.json` should use `PROMPT_BUILD_METHOD=FEW_SHOT`
++- the launch scripts infer this from the dataset filename by default
++
+ ## Benchmark Metrics
+ 
+ - **Throughput**: Request processed per second.  
+diff --git a/benchmarks/rag/launch_lmcache.sh b/benchmarks/rag/launch_lmcache.sh
+index d0cf5ff..8ac76fd 100644
+--- a/benchmarks/rag/launch_lmcache.sh
++++ b/benchmarks/rag/launch_lmcache.sh
+@@ -1,30 +1,96 @@
+ #!/usr/bin/env bash
+-MODEL_NAME="mistralai/Mistral-7B-Instruct-v0.2"
+-DATASET_PATH=~/CacheBlend/inputs/musique_s.json
+-PROMPT_BUILD_METHOD=QA
+-KV_STORAGE_SIZE=30GB
+-KV_CHUNK_SIZE=256
+-QPS=3.5
+-BASE_URL="http://localhost:8000/v1"
+-DATASET_NAME=$(echo $DATASET_PATH | awk -F'/' '{print $NF}' | awk -F'.' '{print $1}')
+-OUTPUT_FILE="$DATASET_NAME"_lmcache_qps_"$QPS".csv
+-
+-export LMCACHE_CONFIG_FILE="example_blending.yaml"
+-
+-log_str=$(python3 precompute.py --model "$MODEL_NAME"\
+-    --dataset "$DATASET_PATH" \
+-    --prompt-build-method $PROMPT_BUILD_METHOD \
+-    --kv-storage-size $KV_STORAGE_SIZE --kv-chunk-size $KV_CHUNK_SIZE \
+-    --base-url $BASE_URL)
++set -euo pipefail
++
++SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
++PYTHON_BIN="${PYTHON_BIN:-python3}"
++MODEL_NAME="${MODEL_NAME:-mistralai/Mistral-7B-Instruct-v0.2}"
++DATASET_PATH="${DATASET_PATH:-$SCRIPT_DIR/inputs/musique_s.json}"
++KV_STORAGE_SIZE="${KV_STORAGE_SIZE:-30GB}"
++KV_CHUNK_SIZE="${KV_CHUNK_SIZE:-256}"
++QPS="${QPS:-3.5}"
++BASE_URL="${BASE_URL:-http://localhost:8000/v1}"
++API_KEY="${API_KEY:-EMPTY}"
++END_INDEX="${END_INDEX:-}"
++MAX_TOKENS="${MAX_TOKENS:-32}"
++BLEND_SEPARATOR="${BLEND_SEPARATOR:- # # }"
++
++check_endpoint() {
++    if ! "$PYTHON_BIN" - <<'PY' "$BASE_URL"; then
++import sys
++from urllib.error import URLError
++from urllib.request import urlopen
++
++base_url = sys.argv[1].rstrip("/")
++try:
++    with urlopen(f"{base_url}/models", timeout=5) as response:
++        if response.status >= 400:
++            raise RuntimeError(f"HTTP {response.status}")
++except (URLError, RuntimeError) as exc:
++    print(
++        f"Serving endpoint is not reachable at {base_url}/models: {exc}",
++        file=sys.stderr,
++    )
++    raise SystemExit(1)
++PY
++        exit 1
++    fi
++}
++
++infer_prompt_build_method() {
++    local dataset_basename
++    dataset_basename=$(basename "$1" | tr '[:upper:]' '[:lower:]')
++    case "$dataset_basename" in
++        *samsum*|*multinews*)
++            echo "FEW_SHOT"
++            ;;
++        *)
++            echo "QA"
++            ;;
++    esac
++}
++
++PROMPT_BUILD_METHOD="${PROMPT_BUILD_METHOD:-$(infer_prompt_build_method "$DATASET_PATH")}"
++DATASET_NAME=$(basename "$DATASET_PATH")
++DATASET_NAME="${DATASET_NAME%.*}"
++OUTPUT_FILE="${OUTPUT_FILE:-${DATASET_NAME}_lmcache_qps_${QPS}.csv}"
++
++check_endpoint
++
++PRECOMPUTE_ARGS=(
++    "$SCRIPT_DIR/precompute.py"
++    --model "$MODEL_NAME"
++    --dataset "$DATASET_PATH"
++    --prompt-build-method "$PROMPT_BUILD_METHOD"
++    --kv-chunk-size "$KV_CHUNK_SIZE"
++    --base-url "$BASE_URL"
++    --api-key "$API_KEY"
++)
++
++if [[ -z "$END_INDEX" && -n "$KV_STORAGE_SIZE" ]]; then
++    PRECOMPUTE_ARGS+=(--kv-storage-size "$KV_STORAGE_SIZE")
++fi
++
++if [[ -n "$END_INDEX" ]]; then
++    PRECOMPUTE_ARGS+=(--end-index "$END_INDEX")
++fi
++
++log_str=$("$PYTHON_BIN" "${PRECOMPUTE_ARGS[@]}")
+ echo "$log_str"
+-RETURNED_END_INDEX=$(echo "$log_str" | awk '{print $5}')
+-# Assert non-empty.
+-if [ -z "$RETURNED_END_INDEX" ]; then
+-    echo "Precompute returns empty end index"
++RETURNED_END_INDEX=$(awk '/^Precompute from /{print $5}' <<<"$log_str" | tail -n1)
++
++if [[ -z "$RETURNED_END_INDEX" ]]; then
++    echo "Precompute returned an empty end index"
+     exit 1
+ fi
+-python3 rag.py --qps $QPS\
+- --model "$MODEL_NAME" --dataset "$DATASET_PATH" \
+- --end-index "$RETURNED_END_INDEX" --separator "[BLEND_SEP]"\
+-  --prompt-build-method $PROMPT_BUILD_METHOD --base-url $BASE_URL \
+-  --max-tokens 32 --output "$OUTPUT_FILE"
+\ No newline at end of file
++
++"$PYTHON_BIN" "$SCRIPT_DIR/rag.py" \
++    --qps "$QPS" \
++    --model "$MODEL_NAME" \
++    --dataset "$DATASET_PATH" \
++    --end-index "$RETURNED_END_INDEX" \
++    --separator "$BLEND_SEPARATOR" \
++    --prompt-build-method "$PROMPT_BUILD_METHOD" \
++    --base-url "$BASE_URL" \
++    --api-key "$API_KEY" \
++    --max-tokens "$MAX_TOKENS" \
++    --output "$OUTPUT_FILE"
+diff --git a/benchmarks/rag/launch_vllm.sh b/benchmarks/rag/launch_vllm.sh
+old mode 100644
+new mode 100755
+index 3b174d0..27d4c45
+--- a/benchmarks/rag/launch_vllm.sh
++++ b/benchmarks/rag/launch_vllm.sh
+@@ -1,15 +1,78 @@
+ #!/usr/bin/env bash
+-MODEL_NAME="mistralai/Mistral-7B-Instruct-v0.2"
+-DATASET_PATH=~/CacheBlend/inputs/musique_s.json
+-PROMPT_BUILD_METHOD=QA
+-QPS=3.5
+-END_INDEX=32
+-BASE_URL="http://localhost:8000/v1"
+-DATASET_NAME=$(echo $DATASET_PATH | awk -F'/' '{print $NF}' | awk -F'.' '{print $1}')
+-OUTPUT_FILE="$DATASET_NAME"_vllm_qps_"$QPS".csv
+-
+-python3 rag.py --qps $QPS\
+- --model "$MODEL_NAME" --dataset "$DATASET_PATH" \
+- --end-index "$END_INDEX" --warmup \
+- --prompt-build-method $PROMPT_BUILD_METHOD --base-url $BASE_URL \
+- --max-tokens 32 --output "$OUTPUT_FILE"
+\ No newline at end of file
++set -euo pipefail
++
++SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
++PYTHON_BIN="${PYTHON_BIN:-python3}"
++MODEL_NAME="${MODEL_NAME:-mistralai/Mistral-7B-Instruct-v0.2}"
++DATASET_PATH="${DATASET_PATH:-$SCRIPT_DIR/inputs/musique_s.json}"
++QPS="${QPS:-3.5}"
++END_INDEX="${END_INDEX:-}"
++BASE_URL="${BASE_URL:-http://localhost:8000/v1}"
++API_KEY="${API_KEY:-EMPTY}"
++MAX_TOKENS="${MAX_TOKENS:-32}"
++
++check_endpoint() {
++    if ! "$PYTHON_BIN" - <<'PY' "$BASE_URL"; then
++import sys
++from urllib.error import URLError
++from urllib.request import urlopen
++
++base_url = sys.argv[1].rstrip("/")
++try:
++    with urlopen(f"{base_url}/models", timeout=5) as response:
++        if response.status >= 400:
++            raise RuntimeError(f"HTTP {response.status}")
++except (URLError, RuntimeError) as exc:
++    print(
++        f"Serving endpoint is not reachable at {base_url}/models: {exc}",
++        file=sys.stderr,
++    )
++    raise SystemExit(1)
++PY
++        exit 1
++    fi
++}
++
++infer_prompt_build_method() {
++    local dataset_basename
++    dataset_basename=$(basename "$1" | tr '[:upper:]' '[:lower:]')
++    case "$dataset_basename" in
++        *samsum*|*multinews*)
++            echo "FEW_SHOT"
++            ;;
++        *)
++            echo "QA"
++            ;;
++    esac
++}
++
++PROMPT_BUILD_METHOD="${PROMPT_BUILD_METHOD:-$(infer_prompt_build_method "$DATASET_PATH")}"
++DATASET_NAME=$(basename "$DATASET_PATH")
++DATASET_NAME="${DATASET_NAME%.*}"
++OUTPUT_FILE="${OUTPUT_FILE:-${DATASET_NAME}_vllm_qps_${QPS}.csv}"
++
++if [[ -z "$END_INDEX" ]]; then
++    END_INDEX=$(
++        "$PYTHON_BIN" - <<'PY' "$DATASET_PATH"
++import json
++import sys
++
++with open(sys.argv[1]) as f:
++    print(len(json.load(f)))
++PY
++    )
++fi
++
++check_endpoint
++
++"$PYTHON_BIN" "$SCRIPT_DIR/rag.py" \
++    --qps "$QPS" \
++    --model "$MODEL_NAME" \
++    --dataset "$DATASET_PATH" \
++    --end-index "$END_INDEX" \
++    --warmup \
++    --prompt-build-method "$PROMPT_BUILD_METHOD" \
++    --base-url "$BASE_URL" \
++    --api-key "$API_KEY" \
++    --max-tokens "$MAX_TOKENS" \
++    --output "$OUTPUT_FILE"
+diff --git a/benchmarks/rag/precompute.py b/benchmarks/rag/precompute.py
+index 075e3bf..c1928d9 100644
+--- a/benchmarks/rag/precompute.py
++++ b/benchmarks/rag/precompute.py
+@@ -1,12 +1,14 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # Standard
+ from dataclasses import dataclass
+-from typing import Tuple
++from typing import Optional, Tuple
+ import argparse
+ 
+ # Third Party
+-from lmcache_vllm.blend_adapter import OnlineKVPreCompute
++from openai import OpenAI
+ from transformers import AutoConfig, AutoTokenizer
++
++# Local
+ from utils import (
+     PromptBuildMethodType,
+     build_fewshot_prompt,
+@@ -57,15 +59,96 @@ class KVSizeCalculator:
+         return token_cnt * self.ratio
+ 
+ 
+-def precompute_all_kv(config: PrecomputeConfig) -> Tuple[int, int, str]:
+-    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer)
+-    model_config = AutoConfig.from_pretrained(config.model_config)
+-    kv_size_calculator = KVSizeCalculator(
+-        model_config.num_key_value_heads,
+-        model_config.head_dim,
++class EndpointPrecomputer:
++    """Populate the serving endpoint cache by issuing lightweight requests."""
++
++    def __init__(self, api_key: str, base_url: str, model: str) -> None:
++        self._client = OpenAI(api_key=api_key, base_url=base_url)
++        self.model = model
++
++    def precompute_kv(self, prompt: str) -> None:
++        self._client.completions.create(
++            model=self.model,
++            prompt=prompt,
++            max_tokens=1,
++            temperature=0.0,
++            extra_body={"ignore_eos": True},
++        )
++
++
++def _get_num_key_value_heads(model_config) -> int:
++    if hasattr(model_config, "num_key_value_heads"):
++        return model_config.num_key_value_heads
++    if hasattr(model_config, "num_attention_heads"):
++        return model_config.num_attention_heads
++    raise AttributeError("Model config is missing num_key_value_heads")
++
++
++def _get_head_dim(model_config) -> int:
++    if hasattr(model_config, "head_dim"):
++        return model_config.head_dim
++    if hasattr(model_config, "hidden_size") and hasattr(
++        model_config, "num_attention_heads"
++    ):
++        return model_config.hidden_size // model_config.num_attention_heads
++    raise AttributeError("Model config is missing head_dim")
++
++
++def _build_kv_size_calculator(
++    model_config_name: str, kv_precision: int
++) -> KVSizeCalculator:
++    try:
++        model_config = AutoConfig.from_pretrained(model_config_name)
++    except Exception as exc:
++        raise RuntimeError(
++            "Failed to load the model config for size-limited precompute. "
++            "If you are working offline, set --end-index and omit "
++            "--kv-storage-size so precompute can run without fetching "
++            "tokenizer/config files."
++        ) from exc
++    return KVSizeCalculator(
++        _get_num_key_value_heads(model_config),
++        _get_head_dim(model_config),
+         model_config.num_hidden_layers,
+-        config.kv_precision,
++        kv_precision,
+     )
++
++
++def _estimate_case_size(
++    doc_prompts: list[str],
++    tokenizer,
++    round_up_token_cnt: int,
++    kv_size_calculator: KVSizeCalculator,
++) -> int:
++    token_cnt = 0
++    for doc_prompt in doc_prompts:
++        assert len(doc_prompt) > 0
++        input_comps = tokenizer(doc_prompt, add_special_tokens=False).input_ids
++        assert len(input_comps) > 0
++        temp_cnt = len(input_comps)
++        temp_cnt = ((temp_cnt + round_up_token_cnt - 1) // round_up_token_cnt) * (
++            round_up_token_cnt
++        )
++        token_cnt += temp_cnt
++    assert token_cnt > 0, f"token_cnt {token_cnt} <= 0"
++    return kv_size_calculator.get_kv_size(token_cnt)
++
++
++def precompute_all_kv(config: PrecomputeConfig) -> Tuple[int, int, str]:
++    tokenizer = None
++    kv_size_calculator: Optional[KVSizeCalculator] = None
++    if config.kv_storage_size > 0:
++        try:
++            tokenizer = AutoTokenizer.from_pretrained(config.tokenizer)
++        except Exception as exc:
++            raise RuntimeError(
++                "Failed to load the tokenizer for size-limited precompute. "
++                "If you already know how many requests to benchmark, set "
++                "--end-index and omit --kv-storage-size."
++            ) from exc
++        kv_size_calculator = _build_kv_size_calculator(
++            config.model_config, config.kv_precision
++        )
+     eval_dataset = load_dataset(config.dataset)
+     start_idx = config.start_idx
+     end_idx = config.end_idx
+@@ -77,11 +160,10 @@ def precompute_all_kv(config: PrecomputeConfig) -> Tuple[int, int, str]:
+     assert start_idx < len(eval_dataset), (
+         f"start_idx {start_idx} >= length of dataset {len(eval_dataset)}"
+     )
+-    precompute_kv = OnlineKVPreCompute(config.api_key, config.base_url, tokenizer)
+-    with_bos = precompute_kv._blend_add_special_in_precomp
++    precompute_kv = EndpointPrecomputer(config.api_key, config.base_url, config.model)
+     current_size_taken = 0
+     size_upper_bound = config.kv_storage_size
+-    assert size_upper_bound > 0, f"size_upper_bound {size_upper_bound} <= 0"
++    has_size_limit = size_upper_bound > 0
+     current_idx = start_idx
+     round_up_token_cnt = config.kv_chunk_size
+     assert round_up_token_cnt >= 1
+@@ -102,30 +184,22 @@ def precompute_all_kv(config: PrecomputeConfig) -> Tuple[int, int, str]:
+         elif config.prompt_build_method == PromptBuildMethodType.FEW_SHOT:
+             doc_prompts, _ = build_fewshot_prompt(example)
+         assert doc_prompts is not None
+-        # NOTE: Do not need chat template here.
+-        # It should only affect system prompt and query prompt.
+-        token_cnt = 0
+-        for doc_prompt in doc_prompts:
+-            assert len(doc_prompt) > 0
+-            input_comps = tokenizer(doc_prompt).input_ids
+-            assert len(input_comps) > 0
+-            temp_cnt = len(input_comps)
+-            if not with_bos:
+-                if input_comps[0] == tokenizer.bos_token_id:
+-                    temp_cnt -= 1
+-            # Add doc token count before round up.
+-            temp_cnt = (
+-                (temp_cnt + round_up_token_cnt - 1) // round_up_token_cnt
+-            ) * round_up_token_cnt
+-            token_cnt += temp_cnt
+-        assert token_cnt > 0, f"token_cnt {token_cnt} <= 0"
+-        this_case_size = kv_size_calculator.get_kv_size(token_cnt)
+-        if current_size_taken + this_case_size > size_upper_bound:
+-            break
++        if has_size_limit:
++            assert tokenizer is not None
++            assert kv_size_calculator is not None
++            this_case_size = _estimate_case_size(
++                doc_prompts,
++                tokenizer,
++                round_up_token_cnt,
++                kv_size_calculator,
++            )
++            if current_size_taken + this_case_size > size_upper_bound:
++                break
+         for prompt in doc_prompts:
+             precompute_kv.precompute_kv(prompt)
+         current_idx += 1
+-        current_size_taken += this_case_size
++        if has_size_limit:
++            current_size_taken += this_case_size
+ 
+     return start_idx, current_idx, precompute_kv.model
+ 
+diff --git a/benchmarks/rag/rag.py b/benchmarks/rag/rag.py
+index 096b57e..4782459 100644
+--- a/benchmarks/rag/rag.py
++++ b/benchmarks/rag/rag.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # Standard
+ from dataclasses import dataclass
++from typing import Any
+ import argparse
+ import asyncio
+ import logging
+@@ -8,7 +9,7 @@ import random
+ import time
+ 
+ # Third Party
+-from transformers import AutoTokenizer
++from openai import APIConnectionError, BadRequestError
+ from utils import (
+     AsyncLoopWrapper,
+     PromptBuildMethodType,
+@@ -77,6 +78,27 @@ class Response:
+     generation_tokens: int
+     launch_time: float
+     finish_time: float
++    success: bool
++    error_message: str = ""
++
++
++def normalize_answers(raw_answers: list[Any]) -> list[str]:
++    normalized_answers: list[str] = []
++
++    def _collect(answer: Any) -> None:
++        if answer is None:
++            return
++        if isinstance(answer, str):
++            normalized_answers.append(answer)
++            return
++        if isinstance(answer, (list, tuple)):
++            for item in answer:
++                _collect(item)
++            return
++        normalized_answers.append(str(answer))
++
++    _collect(raw_answers)
++    return normalized_answers
+ 
+ 
+ def parse_arguments():
+@@ -164,54 +186,100 @@ class RequestExecutor:
+         first_token_time = None
+         words = ""
+         response = None
+-        if self.prompt_build_method == PromptBuildMethodType.QA:
+-            messages = [{"role": "user", "content": prompt}]
+-            response = await self.client.chat.completions.create(
+-                messages=messages,
+-                model=self.model,
+-                temperature=0,
+-                stream=True,
+-                max_tokens=max_tokens,
+-                stream_options={"include_usage": True},
++        last_chunk = None
++        try:
++            if self.prompt_build_method == PromptBuildMethodType.QA:
++                messages = [{"role": "user", "content": prompt}]
++                response = await self.client.chat.completions.create(
++                    messages=messages,
++                    model=self.model,
++                    temperature=0,
++                    stream=True,
++                    max_tokens=max_tokens,
++                    stream_options={"include_usage": True},
++                )
++            elif self.prompt_build_method == PromptBuildMethodType.FEW_SHOT:
++                response = await self.client.completions.create(
++                    prompt=prompt,
++                    model=self.model,
++                    temperature=0,
++                    stream=True,
++                    max_tokens=max_tokens,
++                    stream_options={"include_usage": True},
++                )
++            else:
++                raise ValueError(
++                    f"Invalid prompt build method {self.prompt_build_method}"
++                )
++            async for tok in response:
++                last_chunk = tok
++                if not tok.choices:
++                    continue
++                if self.prompt_build_method == PromptBuildMethodType.QA:
++                    chunk_message = tok.choices[0].delta.content
++                else:
++                    chunk_message = tok.choices[0].text
++                if chunk_message is not None:
++                    if first_token_time is None and chunk_message != "":
++                        first_token_time = time.time()
++                    words += chunk_message
++            usage = getattr(last_chunk, "usage", None)
++            tokens_out = getattr(usage, "completion_tokens", 0) or 0
++            tokens_prefill = getattr(usage, "prompt_tokens", 0) or 0
++            finish_time = time.time()
++            if first_token_time is None:
++                ttft = -1.0
++                generation_time = 0.0
++            else:
++                ttft = first_token_time - start_time
++                generation_time = finish_time - first_token_time
++            return Response(
++                request_id=request_id,
++                body=words,
++                ttft=ttft,
++                generation_time=generation_time,
++                prompt_tokens=tokens_prefill,
++                generation_tokens=tokens_out,
++                launch_time=start_time,
++                finish_time=finish_time,
++                success=True,
+             )
+-        elif self.prompt_build_method == PromptBuildMethodType.FEW_SHOT:
+-            response = await self.client.completions.create(
+-                prompt=prompt,
+-                model=self.model,
+-                temperature=0,
+-                stream=True,
+-                max_tokens=max_tokens,
+-                stream_options={"include_usage": True},
++        except BadRequestError as exc:
++            finish_time = time.time()
++            logger.error(
++                "Request %s was rejected by the server: %s",
++                request_id,
++                exc,
++            )
++            return Response(
++                request_id=request_id,
++                body="",
++                ttft=-1.0,
++                generation_time=0.0,
++                prompt_tokens=0,
++                generation_tokens=0,
++                launch_time=start_time,
++                finish_time=finish_time,
++                success=False,
++                error_message=str(exc),
+             )
+-        else:
+-            raise ValueError(f"Invalid prompt build method {self.prompt_build_method}")
+-        async for tok in response:
+-            if not tok.choices:
+-                continue
+-            chunk_message = tok.choices[0].delta.content
+-            if chunk_message is not None:
+-                if first_token_time is None and chunk_message != "":
+-                    first_token_time = time.time()
+-                words += chunk_message
+-        tokens_out = tok.usage.completion_tokens
+-        tokens_prefill = tok.usage.prompt_tokens
+-        finish_time = time.time()
+-        return Response(
+-            request_id=request_id,
+-            body=words,
+-            ttft=first_token_time - start_time,
+-            generation_time=finish_time - first_token_time,
+-            prompt_tokens=tokens_prefill,
+-            generation_tokens=tokens_out,
+-            launch_time=start_time,
+-            finish_time=finish_time,
+-        )
+ 
+     def launch_request(self, request_id: int, prompt, max_tokens, finish_callback):
+         """
+         finish_callback: Callable[[Response], None]
+         """
+-        real_callback = lambda x: finish_callback(x.result())
++        def real_callback(future) -> None:
++            try:
++                finish_callback(future.result())
++            except APIConnectionError as exc:
++                logger.error(
++                    "Failed to reach the serving endpoint at %s for request %s: %s",
++                    self.client.base_url,
++                    request_id,
++                    exc,
++                )
++                raise
++
+         future = asyncio.run_coroutine_threadsafe(
+             self._async_launch_request(request_id, prompt, max_tokens),
+             self.loop,
+@@ -258,14 +326,13 @@ class RAGManager:
+                 workload_config.prompt_build_method,
+             )
+             self._prompts.append(prompt)
+-            self._answers.append(ex["answers"])
++            self._answers.append(normalize_answers(ex["answers"]))
+             self._generated_text.append(None)
+             self._generation_time.append(None)
+             self._prefill_tok_cnt.append(None)
+             self._generation_tok_cnt.append(None)
+             self._ttft.append(None)
+             self._tpot.append(None)
+-        self._tokenizer = AutoTokenizer.from_pretrained(workload_config.tokenizer)
+         self._last_request_time = -1.0
+         self._last_request_index = 0
+         assert workload_config.qps > 0
+@@ -277,6 +344,8 @@ class RAGManager:
+         self._ttft[response.request_id] = response.ttft
+         self._tpot[response.request_id] = (
+             response.generation_time / response.generation_tokens
++            if response.generation_tokens > 0
++            else None
+         )
+         self._generation_time[response.request_id] = response.generation_time
+         self._prefill_tok_cnt[response.request_id] = response.prompt_tokens
+@@ -301,16 +370,19 @@ class RAGManager:
+     def summary(self, start_time: float, end_time: float) -> pd.DataFrame:
+         cnt = len(self._ttft)
+         assert cnt > 0
+-        avg_ttft = sum(ttft for ttft in self._ttft if ttft is not None) / cnt
+-        avg_tpot = sum(tpot for tpot in self._tpot if tpot is not None) / cnt
++        valid_ttfts = [ttft for ttft in self._ttft if ttft is not None and ttft >= 0]
++        valid_tpots = [tpot for tpot in self._tpot if tpot is not None]
++        avg_ttft = sum(valid_ttfts) / len(valid_ttfts) if valid_ttfts else float("nan")
++        avg_tpot = sum(valid_tpots) / len(valid_tpots) if valid_tpots else float("nan")
+         # Create a dataframe
+         quality = []
+         for i in range(cnt):
++            generated_text = self._generated_text[i] or ""
+             if self._build_method == PromptBuildMethodType.QA:
+                 quality.append(
+                     max(
+                         [
+-                            compute_f1(self._generated_text[i], answer, self._tokenizer)
++                            compute_f1(generated_text, answer)
+                             for answer in self._answers[i]
+                         ]
+                     )
+@@ -319,7 +391,7 @@ class RAGManager:
+                 quality.append(
+                     max(
+                         [
+-                            compute_rl(self._generated_text[i], answer)
++                            compute_rl(generated_text, answer)
+                             for answer in self._answers[i]
+                         ]
+                     )
+diff --git a/benchmarks/rag/utils.py b/benchmarks/rag/utils.py
+index cc4340c..0ae7243 100644
+--- a/benchmarks/rag/utils.py
++++ b/benchmarks/rag/utils.py
+@@ -153,6 +153,8 @@ def normalize_question(question):
+ 
+ def parse_generation(s):
+     s = s.lstrip("\n").split("\n")[0]
++    if not s.strip():
++        return ""
+     if s.startswith("Yes") or s.startswith("yes"):
+         s = "Yes"
+     elif (s.split()[0]).startswith("No") or (s.split()[0]).startswith("no"):
+@@ -191,10 +193,10 @@ def build_fewshot_prompt(example):
+     return doc_prompts, q_prompt
+ 
+ 
+-def compute_f1(a_pred, a_gold, tokenizer):
++def compute_f1(a_pred, a_gold):
+     a_pred = parse_generation(a_pred)
+-    gold_toks = tokenizer.encode(normalize_answer(a_gold))[1:]
+-    pred_toks = tokenizer.encode(normalize_answer(a_pred))[1:]
++    gold_toks = normalize_answer(a_gold).split()
++    pred_toks = normalize_answer(a_pred).split()
+     common = collections.Counter(gold_toks) & collections.Counter(pred_toks)
+     num_same = sum(common.values())
+     if len(gold_toks) == 0 or len(pred_toks) == 0:
+diff --git a/lmcache/integration/vllm/vllm_v1_adapter.py b/lmcache/integration/vllm/vllm_v1_adapter.py
+index 0b23335..5e21e78 100644
+--- a/lmcache/integration/vllm/vllm_v1_adapter.py
++++ b/lmcache/integration/vllm/vllm_v1_adapter.py
+@@ -1261,7 +1261,7 @@ class LMCacheConnectorV1Impl:
+ 
+             # token_ids = request.prompt_token_ids
+             # all token ids covers the preemption case
+-            token_ids = request.all_token_ids
++            token_ids = list(request.all_token_ids)
+ 
+             # If the request has multimodal hashes, apply them to the token ids
+             mm_hashes, mm_positions = extract_mm_features(request)
+@@ -1693,3 +1693,4 @@ class LMCacheConnectorV1Impl:
+         if self.lmcache_engine is not None:
+             return self.lmcache_engine.get_kv_events()
+         return []
++
+diff --git a/lmcache/v1/compute/attention/utils.py b/lmcache/v1/compute/attention/utils.py
+index 79c5a48..34560c7 100644
+--- a/lmcache/v1/compute/attention/utils.py
++++ b/lmcache/v1/compute/attention/utils.py
+@@ -1,14 +1,16 @@
+ # SPDX-License-Identifier: Apache-2.0
+-# Local
+-from .flash_attn import LMCFlashAttnBackend
+-from .flash_infer_sparse import LMCFlashInferSparseBackend
+-
+-
+ def infer_attn_backend_from_vllm(vllm_attn, enable_sparse=False):
+     attn_name = type(vllm_attn.impl).__name__
+     if attn_name == "FlashInferImpl" and enable_sparse:
++        # Local
++        from .flash_infer_sparse import LMCFlashInferSparseBackend
++
+         return LMCFlashInferSparseBackend(vllm_attn)
+     elif attn_name == "FlashAttentionImpl" and not enable_sparse:
++        # Local
++        from .flash_attn import LMCFlashAttnBackend
++
+         return LMCFlashAttnBackend(vllm_attn)
+     else:
+         raise ValueError(f"Attention backend {attn_name} is not supported in LMCache.")
++
+diff --git a/lmcache/v1/compute/positional_encoding.py b/lmcache/v1/compute/positional_encoding.py
+index bc95665..2ae04a0 100644
+--- a/lmcache/v1/compute/positional_encoding.py
++++ b/lmcache/v1/compute/positional_encoding.py
+@@ -180,14 +180,27 @@ def get_fused_rope(
+         if "type" in rope_scaling:
+             new_rope_params["rope_type"] = rope_scaling["type"]
+ 
+-    rope = vllm_get_rope(
+-        head_size=head_size,
+-        max_position=max_position,
+-        is_neox_style=is_neox_style,
+-        rope_parameters=new_rope_params,
+-        dtype=dtype,
+-        dual_chunk_attention_config=None,
+-    )
++    try:
++        rope = vllm_get_rope(
++            head_size=head_size,
++            max_position=max_position,
++            is_neox_style=is_neox_style,
++            rope_parameters=new_rope_params,
++            dtype=dtype,
++            dual_chunk_attention_config=None,
++        )
++    except TypeError:
++        rope = vllm_get_rope(
++            head_size=head_size,
++            rotary_dim=rotary_dim,
++            max_position=max_position,
++            base=base,
++            is_neox_style=is_neox_style,
++            rope_scaling=rope_scaling,
++            dtype=dtype,
++            partial_rotary_factor=partial_rotary_factor,
++            dual_chunk_attention_config=None,
++        )
+ 
+     reverse_rope = BasicReverseRope(rope, rotary_dim, is_neox_style)
+     fused_rope = FusedRope(rope, is_neox_style)
+@@ -200,3 +213,4 @@ def get_fused_rope(
+         return None
+ 
+     return fused_rope
++
