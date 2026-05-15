@@ -1,5 +1,7 @@
 # llm-kv-cache-recompute
 
+[presentation](https://docs.google.com/presentation/d/1ozZxBl4N60kdMC4TPRJsMAOTHoAGvWK9aogDtjHsiYg/edit?slide=id.g3e24d09a682_2_196#slide=id.g3e24d09a682_2_196)
+
 This repository is based on [LMCache](https://github.com/LMCache/LMCache) and contains a modified, benchmark-focused version of the project. The original LMCache codebase is licensed under the Apache License 2.0; this repository keeps that license and includes local changes for running and evaluating RAG workloads.
 
 LMCache is a KV cache management layer for LLM serving. It reduces time to first token and improves throughput by storing and reusing KV caches across memory and storage tiers such as GPU, CPU, disk, and remote storage. This is especially useful for long-context and retrieval-augmented generation workloads, where many requests reuse the same documents or context passages.
